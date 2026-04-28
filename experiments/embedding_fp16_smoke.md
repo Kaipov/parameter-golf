@@ -2,7 +2,10 @@
 
 Goal: compare the normal int8 embedding artifact against an fp16-stored embedding artifact, without changing training.
 
-The baseline quantizer stores large tensors as int8 with per-row fp16 scales. Setting `EMBEDDING_STORE_DTYPE=fp16` keeps `tok_emb.weight` as fp16 in the compressed artifact, then restores it to the original dtype after loading.
+The baseline quantizer stores large tensors as int8 with per-row fp16 scales. Setting `EVAL_EMBEDDING_STORE_DTYPES=int8,fp16` trains once, then serializes and evaluates the same trained weights twice:
+
+- `int8`: baseline artifact format
+- `fp16`: keep `tok_emb.weight` as fp16 in the compressed artifact
 
 Run from `/workspace/parameter-golf-fork` after pulling the latest branch:
 
@@ -17,11 +20,11 @@ smoke_relu2_warmdown100_1000 final val_bpb: 1.36562538
 smoke_relu2_warmdown100_1000 total int8+zlib bytes: 14553178
 ```
 
-Now run the fp16 embedding variant with the same training settings:
+Now run the paired artifact comparison with the same training settings:
 
 ```bash
-RUN_ID=smoke_relu2_warmdown100_embfp16_1000 \
-EMBEDDING_STORE_DTYPE=fp16 \
+RUN_ID=smoke_relu2_warmdown100_embcompare_1000 \
+EVAL_EMBEDDING_STORE_DTYPES=int8,fp16 \
 DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
 VOCAB_SIZE=1024 \
@@ -36,8 +39,9 @@ torchrun --standalone --nproc_per_node=1 train_gpt.py
 Compare:
 
 ```text
-final_int8_zlib_roundtrip_exact val_loss:... val_bpb:...
-Total submission size int8+zlib: ... bytes
+final_int8_zlib_roundtrip_exact embedding_store_dtype:int8 val_loss:... val_bpb:...
+final_int8_zlib_roundtrip_exact embedding_store_dtype:fp16 val_loss:... val_bpb:...
+embedding_store_compare baseline:int8 candidate:fp16 delta_val_loss:... delta_val_bpb:... delta_bytes:...
 ```
 
-This isolates the serialization/evaluation effect of fp16 embeddings. Training should be essentially the same as the int8 reference because the change happens only when writing the final compressed artifact.
+This isolates the serialization/evaluation effect of fp16 embeddings because both artifact variants come from the same trained weights.

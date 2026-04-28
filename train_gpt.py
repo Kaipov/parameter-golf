@@ -310,6 +310,17 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 EMBEDDING_STORE_DTYPE = os.environ.get("EMBEDDING_STORE_DTYPE", "int8").lower()
 if EMBEDDING_STORE_DTYPE not in {"int8", "fp16"}:
     raise ValueError(f"Unsupported EMBEDDING_STORE_DTYPE={EMBEDDING_STORE_DTYPE!r}; expected int8 or fp16")
+EVAL_EMBEDDING_STORE_DTYPES = tuple(
+    dtype.strip().lower()
+    for dtype in os.environ.get("EVAL_EMBEDDING_STORE_DTYPES", EMBEDDING_STORE_DTYPE).split(",")
+    if dtype.strip()
+)
+if not EVAL_EMBEDDING_STORE_DTYPES:
+    raise ValueError("EVAL_EMBEDDING_STORE_DTYPES must contain at least one dtype")
+if any(dtype not in {"int8", "fp16"} for dtype in EVAL_EMBEDDING_STORE_DTYPES):
+    raise ValueError(
+        f"Unsupported EVAL_EMBEDDING_STORE_DTYPES={EVAL_EMBEDDING_STORE_DTYPES!r}; expected int8 and/or fp16"
+    )
 EMBEDDING_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get("EMBEDDING_NAME_PATTERNS", "tok_emb.weight").split(",")
@@ -348,12 +359,14 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], embedding_store_dtype: str = EMBEDDING_STORE_DTYPE):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
     # - exact passthrough for non-floats
     # - passthrough for small float tensors, stored as fp16 to save bytes
+    if embedding_store_dtype not in {"int8", "fp16"}:
+        raise ValueError(f"Unsupported embedding_store_dtype={embedding_store_dtype!r}; expected int8 or fp16")
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -377,7 +390,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        if EMBEDDING_STORE_DTYPE == "fp16" and any(pattern in name for pattern in EMBEDDING_NAME_PATTERNS):
+        if embedding_store_dtype == "fp16" and any(pattern in name for pattern in EMBEDDING_NAME_PATTERNS):
             passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
             kept = t.to(dtype=torch.float16).contiguous()
             passthrough[name] = kept
@@ -927,6 +940,7 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"mlp_activation:{args.mlp_activation} mlp_mult:{args.mlp_mult}")
     log0(f"embedding_store_dtype:{EMBEDDING_STORE_DTYPE}")
+    log0(f"eval_embedding_store_dtypes:{','.join(EVAL_EMBEDDING_STORE_DTYPES)}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1103,50 +1117,97 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
-    if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-        log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+    trained_state = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in base_model.state_dict().items()
+    }
+    eval_results: dict[str, tuple[float, float, int]] = {}
+    for embedding_store_dtype in EVAL_EMBEDDING_STORE_DTYPES:
+        base_model.load_state_dict(trained_state, strict=True)
+        suffix = "" if embedding_store_dtype == "int8" else f".emb_{embedding_store_dtype}"
+        quant_path = f"final_model{suffix}.int8.ptz"
+        quant_obj, quant_stats = quantize_state_dict_int8(
+            base_model.state_dict(),
+            embedding_store_dtype=embedding_store_dtype,
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        quant_buf = io.BytesIO()
+        torch.save(quant_obj, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        quant_blob = zlib.compress(quant_raw, level=9)
+        quant_raw_bytes = len(quant_raw)
+        if master_process:
+            with open(quant_path, "wb") as f:
+                f.write(quant_blob)
+            quant_file_bytes = os.path.getsize(quant_path)
+            code_bytes = len(code.encode("utf-8"))
+            ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+            log0(
+                f"Serialized model int8+zlib embedding_store_dtype:{embedding_store_dtype} "
+                f"path:{quant_path} bytes:{quant_file_bytes} "
+                f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            )
+            log0(
+                f"Total submission size int8+zlib embedding_store_dtype:{embedding_store_dtype}: "
+                f"{quant_file_bytes + code_bytes} bytes"
+            )
+            if EVAL_EMBEDDING_STORE_DTYPES == ("int8",):
+                log0(
+                    f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+                    f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+                )
+                log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
-    if distributed:
-        dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        if distributed:
+            dist.barrier()
+        with open(quant_path, "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        eval_time_ms = 1000.0 * (time.perf_counter() - t_qeval)
+        if master_process:
+            eval_results[embedding_store_dtype] = (q_val_loss, q_val_bpb, quant_file_bytes + code_bytes)
+        log0(
+            f"final_int8_zlib_roundtrip embedding_store_dtype:{embedding_store_dtype} "
+            f"val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{eval_time_ms:.0f}ms"
+        )
+        log0(
+            f"final_int8_zlib_roundtrip_exact embedding_store_dtype:{embedding_store_dtype} "
+            f"val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
+        )
+        if EVAL_EMBEDDING_STORE_DTYPES == ("int8",):
+            log0(
+                f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+                f"eval_time:{eval_time_ms:.0f}ms"
+            )
+            log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    base_model.load_state_dict(trained_state, strict=True)
+    if master_process and len(eval_results) > 1:
+        baseline_loss, baseline_bpb, baseline_bytes = eval_results[EVAL_EMBEDDING_STORE_DTYPES[0]]
+        for embedding_store_dtype in EVAL_EMBEDDING_STORE_DTYPES[1:]:
+            q_val_loss, q_val_bpb, total_bytes = eval_results[embedding_store_dtype]
+            log0(
+                f"embedding_store_compare baseline:{EVAL_EMBEDDING_STORE_DTYPES[0]} "
+                f"candidate:{embedding_store_dtype} "
+                f"delta_val_loss:{q_val_loss - baseline_loss:+.8f} "
+                f"delta_val_bpb:{q_val_bpb - baseline_bpb:+.8f} "
+                f"delta_bytes:{total_bytes - baseline_bytes:+d}"
+            )
 
     if distributed:
         dist.destroy_process_group()
