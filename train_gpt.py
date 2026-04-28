@@ -307,6 +307,14 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+EMBEDDING_STORE_DTYPE = os.environ.get("EMBEDDING_STORE_DTYPE", "int8").lower()
+if EMBEDDING_STORE_DTYPE not in {"int8", "fp16"}:
+    raise ValueError(f"Unsupported EMBEDDING_STORE_DTYPE={EMBEDDING_STORE_DTYPE!r}; expected int8 or fp16")
+EMBEDDING_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("EMBEDDING_NAME_PATTERNS", "tok_emb.weight").split(",")
+    if pattern
+)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -367,6 +375,13 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if EMBEDDING_STORE_DTYPE == "fp16" and any(pattern in name for pattern in EMBEDDING_NAME_PATTERNS):
+            passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            kept = t.to(dtype=torch.float16).contiguous()
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -911,6 +926,7 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"mlp_activation:{args.mlp_activation} mlp_mult:{args.mlp_mult}")
+    log0(f"embedding_store_dtype:{EMBEDDING_STORE_DTYPE}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
